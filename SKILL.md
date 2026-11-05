@@ -585,6 +585,7 @@ ImageGrab.grab(bbox=(l, t, r, b)).save('shot.png')
 | 파일 | 역할 |
 |---|---|
 | `scripts/kt.py` | 통합 CLI |
+| `scripts/kt_mcp.py` | **stdio MCP 서버 (도구 8종)** — `kt_send` 멱등 전송(operation_id) + 구조화 JSON 반환. 전송 원장을 CLI와 공유 |
 | `scripts/kt_room.py` | 창 탐색, OCR, 클립보드 전사 |
 | `scripts/kt_open.py` | OCR 매칭으로 방 열기 |
 | `scripts/win_ocr.ps1` | **Windows OCR 엔진 (필수)** — 없으면 방 열기 전부 실패 |
@@ -622,14 +623,140 @@ ImageGrab.grab(bbox=(l, t, r, b)).save('shot.png')
   `_work/watch_pause` 를 켜면 워처가 폴링 중단 ④복사 직후 `GetForegroundWindow()` 재확인
 - 교훈: **포커스를 쓰는 자동화는 동시 실행 자체가 결함이다.** 단일 인스턴스를 강제할 것.
 
+### ★이미지 전송 — 클립보드 + 전송 확인 팝업 (2026-11-05 실측 확정)
+
+텍스트는 `send_text`(붙여넣기 → Enter)로 보내지만 **이미지는 경로가 다르다.**
+
+1. 클립보드에 **CF_DIB** 적재 — `Image.open(p).convert("RGB").save(buf,"BMP")` 후 **14바이트 BMP 헤더 제거**
+2. 방 창을 **포그라운드**로 (실패하면 `Ctrl+V` 가 유실된다 — 실패 원인의 대부분)
+3. `Ctrl+V` → 카톡이 **'클립보드 이미지 전송' 확인 팝업**을 띄운다. **Enter 로 바로 가지 않는다**
+4. 팝업의 **'전송' 버튼**을 PostMessage 클릭 → 전송 완료
+
+#### ⛔ 팝업을 못 찾아서 반나절 날리는 지점
+
+이 팝업은 방 창의 **자식(WS_CHILD)이 아니라 방 창이 소유한 owned window**다.
+`GetParent()` 는 방 창을 반환하지만 **`EnumChildWindows()` 에는 절대 나타나지 않는다.**
+그래서 "팝업도 없음"으로 오판하고 전송을 계속 실패한다.
+
+- 찾는 법: `EnumWindows()` 로 훑고 `win32gui.GetWindow(ch, GW_OWNER) == 방창hwnd`
+- 식별: 클래스 `EVA_Window_Dblclk`, **제목 없음**, 크기 약 340x400
+
+```python
+def find_popup(room_hwnd):
+    found = []
+    def cb(ch, _):
+        try:
+            if win32gui.GetClassName(ch) != "EVA_Window_Dblclk": return
+            if win32gui.GetWindowText(ch): return
+            if win32gui.GetWindow(ch, win32con.GW_OWNER) != room_hwnd: return
+            l, t, r, b = win32gui.GetWindowRect(ch)
+            if r - l >= 120 and b - t >= 120: found.append(ch)
+        except Exception: pass
+    win32gui.EnumWindows(cb, None)
+    return found[0] if found else None
+```
+
+#### '전송' 버튼 좌표 — 캡처 후 픽셀 스캔
+
+팝업을 캡처해 **하단 22% 영역에서 배경(회색 `246,246,246`)이 아닌 픽셀의 bbox 중앙**을 누른다.
+`PostMessage(WM_LBUTTONDOWN/UP)` 이면 **마우스 커서 이동 0px** 이고 최상위 여부와 무관하다.
+실제 클릭(`mouse_event`)은 오클릭 위험이 있으므로 쓰지 않는다.
+
+```python
+l,t,r,b = win32gui.GetWindowRect(pop)
+img = ImageGrab.grab(bbox=(l,t,r,b)).convert("RGB"); px = img.load(); W,H = img.size
+pts = [(x,y) for y in range(int(H*0.78),H) for x in range(W)
+       if not (abs(px[x,y][0]-px[x,y][1])<12 and abs(px[x,y][1]-px[x,y][2])<12 and px[x,y][0]>232)]
+xs=[p[0] for p in pts]; ys=[p[1] for p in pts]
+sx=(min(xs)+max(xs))//2; sy=(min(ys)+max(ys))//2
+ox,oy = win32gui.ClientToScreen(pop,(0,0)); cx,cy = sx+l-ox, sy+t-oy
+lp = (cy<<16)|(cx%65536)
+win32gui.PostMessage(pop, win32con.WM_LBUTTONDOWN, win32con.WM_LBUTTON, lp)
+win32gui.PostMessage(pop, win32con.WM_LBUTTONUP, 0, lp)
+```
+
+#### 포커스를 훔치는 두 범인
+
+| 범인 | 증상 | 대응 |
+|---|---|---|
+| **`CaptureSelectionWnd`** (클래스 `Afx:*`) | 최대 9개가 떠서 포그라운드·클릭을 가로챈다. `SetForegroundWindow` 가 계속 거부된다 | 시작 시 전부 `WM_CLOSE` |
+| **남아 있는 전송 팝업** | 팝업이 포그라운드를 갖고 있어 방 창이 앞으로 못 온다 → `Ctrl+V` 유실 | 각 장 전송 전에 팝업을 **닫고 `IsWindow` 로 검증** |
+
+#### 닫힌 문 (다시 시도 금지)
+
+- ⛔ `WM_PASTE` 를 입력창(`RICHEDIT50W`)에 직접 PostMessage → **카톡이 무시한다**(실측)
+- ⛔ `kt.clear_input`(Backspace 200회)을 이미지 전송 전에 호출 → 포커스가 흔들려 `Ctrl+V` 유실
+- ⛔ `SwitchToThisWindow` / 최소화복원 / ALT-hold / `AppActivate` — 오버레이가 살아 있으면 **전부 실패**
+  (오버레이를 지우면 대부분의 전송이 1회에 성공한다)
+
+#### 실물 도구
+
+`scripts/kt_img_batch.py` (이 스킬 내부 동봉) — 재시도 루프 + 팝업 자동 클릭 + 오버레이 정리 포함.
+```bash
+python kt_img_batch.py --room "방이름" --dir <미디어폴더> --skip 4 --retries 6
+```
+실측(2026-11-05): 1080x1350 8장 연속 전송 성공, 마우스 커서 **0px** 이동, 장당 약 2초.
+
+#### 영상·문서 전송 — 파일 첨부 다이얼로그 (2026-11-05 실측 확정)
+
+**클립보드로는 영상이 안 된다.** `CF_HDROP`(파일 경로 목록)을 적재해 붙여넣으면
+카톡이 아무 반응도 하지 않는다 — 입력창이 비고 팝업도 안 뜬다.
+
+| 시도 | 결과 |
+|---|---|
+| `CF_HDROP` 단독 적재 → Ctrl+V | 적재는 성공(역조회로 경로 확인), **카톡 무반응** |
+| `RICHEDIT50W` 자식에 `SetFocus` 후 Ctrl+V | 포커스 True 인데도 **무반응** |
+| `Preferred DropEffect`(COPY) 포맷 추가 | 포맷 등록 성공, **여전히 무반응** |
+
+→ 카톡 PC 는 이미지(`CF_DIB`)만 클립보드 붙여넣기를 받는다. 파일은 **탐색기에서
+복사해 붙여넣는 것과 같은 이유로** 거부된다.
+
+**정답 경로는 파일 첨부 아이콘이다.**
+
+1. 입력창 아래 툴바의 **파일 모양(문서) 아이콘** 클릭 — `+` 가 아니다
+2. `#32770` '열기' 다이얼로그가 뜬다 (방 창이 **owner**)
+3. `파일 이름(&N)` 입력란(`ComboBoxEx32 > ComboBox > Edit`)에 절대경로를 `WM_SETTEXT`
+4. `열기(&O)` 버튼 `BM_CLICK`
+5. 카톡이 **'파일 전송' 팝업**을 띄운다 — 버튼 라벨은 `전송`이 아니라 **`1개 전송`**
+6. 그 버튼을 `PostMessage` 클릭 → 전송 완료
+
+#### ⛔ 툴바 아이콘은 자식 창으로 안 잡힌다
+
+owner-drawn 이라 `EnumChildWindows` 에 없다 → **픽셀 스캔**으로 찾는다.
+좌측부터 `[+][이모티콘][파일]` 순서이므로 **가장 오른쪽 군집**이 파일 아이콘이다.
+실측 좌표: 490x736 방 창에서 `x≈88, y≈711` (창 원점 기준).
+
+#### ⛔ 'N개 전송' 버튼은 기존 click_send 스캔 범위 밖에 있다
+
+이미지 팝업용 `click_send()` 는 하단 22%만 스캔한다. 파일 팝업의 버튼은
+높이의 **78%** 지점(실측 300x185 팝업 → 중심 y=144)이라 경계에 걸려 빗나갔다.
+→ `_click_send_ratio()` 가 `0.78 → 0.72 → 0.85` 비율로 순차 시도한다.
+
+#### 실물 도구
+
+`scripts/kt_img_batch.py` (이 스킬 내부 동봉) — 확장자로 자동 분기한다.
+```bash
+python kt_img_batch.py --room "방이름" --dir <미디어폴더> --skip 4 --retries 6
+```
+- 이미지 → `send_image()` : `CF_DIB` 클립보드 경로
+- 영상·문서 → `send_file()` : 파일 첨부 다이얼로그 경로
+
+실측(2026-11-05): 이미지 8장 연속 전송 성공, 마우스 커서 **0px** 이동, 장당 약 2초.
+같은 날 영상 mp4 651KB 파일 첨부 경로 전송 성공(21:08, 0:07 클립).
+
+⚠️ `--dir` 에는 **보낼 파일만** 넣어라. 작업 중 만든 스크린샷·디버그 PNG 가 같이
+들어 있으면 그것까지 전송된다(실측 사고). 실행 전 `ls` 로 목록을 확인할 것.
+
 ## 정합성 검증 (이 스킬을 수정한 뒤 필수)
 
 이 스킬은 **실물 스크립트 동봉 + 2곳 미러** 구조라 문서만 고치면 조용히 어긋난다.
 수정 후 아래 6개를 전부 통과해야 "완료"다.
 
 1. **문서 파일표 ↔ 실물 대조** — 파일표의 모든 경로가 실제로 존재하는지 전수 확인(`누락 0건`). 스크립트를 새로 추가했으면 **표에도 같이 적는다 — 표가 곧 계약이다.**
-2. **문법** — `python -m py_compile kt.py kt_watch.py run_watch.py kt_room.py kt_open.py kt_show.py llm_hook.py`
-3. **미러 일치** — `SKILL.md`·`.gitignore`·`scripts/kt.py`·`scripts/kt_watch.py`·`scripts/run_watch.py`를 `~/.claude/skills/dev/kakaotalk-automation`과 `diff -q`. 불일치면 복사.
+2. **문법** — `python -m py_compile kt.py kt_mcp.py kt_watch.py run_watch.py kt_room.py kt_open.py kt_show.py llm_hook.py` — **`scripts/*.py` 전부** 넣는다. 새 스크립트를 만들고 여기 안 넣으면 문법 검증에서 조용히 빠진다.
+3. **미러 일치** — 파일 목록을 **손으로 나열하지 말고 디렉터리 전체를 대조**한다:
+   `diff -r --brief <원본>/scripts ~/.claude/skills/dev/kakaotalk-automation/scripts` (+ `SKILL.md`·`.gitignore`).
+   이유(2026-11-05 실측): `kt_mcp.py`를 미러에 추가하고 나서도 이 목록이 5개 파일로 고정돼 있어 **새 스크립트가 대조에서 빠져 있었다.** 목록은 반드시 낡는다. 불일치면 복사.
 4. **옵션 잔재** — 제거한 옵션명이 **사용법·예제 구간**과 코드에 `0`건인지 `grep -c`로 확인. 예) 기능 철거 시 문서 사용법 `0` + `--help`의 해당 옵션 `0`. 코드만 지우고 문서에 남기면 다음에 없는 기능을 쓰려 든다.
 5. **워처 상태** — ①단일 프로세스인지 PowerShell CIM으로 PID 확인 ②`grep "모드=" scripts/_watch.log | tail -1` 로 **실전송**인지 확인(DRY-RUN·notify-only로 남아 있지 않은지).
 6. **frontmatter** — `name:`·`description:` 생존 확인. 여기가 깨지면 스킬 로딩 자체가 죽는다(가장 흔한 사망 원인).

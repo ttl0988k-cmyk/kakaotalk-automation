@@ -21,3 +21,6 @@ scripts/*.log
 venv/
 *.log
 scripts/_room/
+
+# 실측 테스트 미디어 (카톡 받은 파일 사본 → 커밋 금지)
+scripts/_videotest/
