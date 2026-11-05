@@ -1,0 +1,23 @@
+# 실행 캐시 · 임시 산출물 (재생성 가능)
+__pycache__/
+*.pyc
+*.pyo
+
+# 캡처/OCR 임시 작업 폴더 (민감한 대화 스크린샷 포함 → 절대 커밋 금지)
+scripts/_work/
+*.png.tmp
+
+# 백업·보관용 (스킬 문서 과거본, 실험 산출물)
+scripts/_archive/
+*_backup_*.md
+
+# 워처 런타임 상태 (기동할 때마다 바뀜)
+scripts/_watch_state.json
+scripts/*.log
+
+# 로컬 환경
+.env
+.venv/
+venv/
+*.log
+scripts/_room/
