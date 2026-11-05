@@ -52,42 +52,18 @@ kt.log = lambda m="": print(m, file=sys.stderr, flush=True)
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 
 # ── 2) 전송 원장 ──────────────────────────────────────────────────────────
-_OPS_DIR = os.path.join(_HERE, "_work")
-_OPS_FILE = os.path.join(_OPS_DIR, "mcp_send_ops.jsonl")
+# ★ CLI(kt.py send) 와 같은 파일을 공유한다. 한쪽에서 보낸 것을 다른 쪽이
+#   알아야 중복 발송이 실제로 막힌다.
+_OPS_FILE = kt.SEND_LEDGER
 
 
 def _ops_read_all():
     """{operation_id: record} — 마지막 기록이 이긴다."""
-    out = {}
-    if not os.path.exists(_OPS_FILE):
-        return out
-    try:
-        with open(_OPS_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except Exception:
-                    continue
-                op = rec.get("operation_id")
-                if op:
-                    out[op] = rec
-    except Exception as e:
-        print("[kt_mcp] ops read fail: %s" % e, file=sys.stderr, flush=True)
-    return out
+    return kt.ledger_read()
 
 
 def _ops_append(rec):
-    os.makedirs(_OPS_DIR, exist_ok=True)
-    try:
-        with open(_OPS_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        return True
-    except Exception as e:
-        print("[kt_mcp] ops write fail: %s" % e, file=sys.stderr, flush=True)
-        return False
+    return kt.ledger_append(rec)
 
 
 def _now():
@@ -370,11 +346,30 @@ def kt_send(room: str, text: str, operation_id: str = "",
         found, rerr = _resolve_room(room, auto_open=True)
         if rerr:
             rec = {"operation_id": op, "room": room, "status": "not_sent",
-                   "code": -2, "error": rerr.get("error"), "at": _now()}
+                   "code": -2, "error": rerr.get("error"),
+                   "text_hash": kt.text_hash(room, str(text)),
+                   "chars": len(str(text)), "ts": time.time(),
+                   "at": _now(), "src": "mcp"}
             _ops_append(rec)
             return json.dumps(dict(ok=False, operation_id=op, **rerr),
                               ensure_ascii=False, indent=2)
         hwnd, title = found
+
+        # 최근 같은 본문을 이미 보냈으면 중복으로 판단해 막는다
+        if not dry_run:
+            dup = kt.ledger_recent_dup(title, str(text), within=60)
+            if dup:
+                return json.dumps({
+                    "ok": False,
+                    "already_sent_recently": True,
+                    "resent": False,
+                    "operation_id": op,
+                    "room": title,
+                    "prior_at": dup.get("at"),
+                    "prior_status": dup.get("status"),
+                    "note": "60초 안에 같은 본문을 이미 보냈습니다. 중복 발송으로 판단해 "
+                            "취소했습니다. 실제 도착은 kt_read 로 확인하세요.",
+                }, ensure_ascii=False, indent=2)
 
         code = kt.send_text(
             hwnd, title, str(text),
@@ -399,8 +394,11 @@ def kt_send(room: str, text: str, operation_id: str = "",
     else:
         status = "failed"
 
-    rec = {"operation_id": op, "room": room, "status": status,
-           "code": code, "chars": len(str(text)), "at": _now()}
+    rec = {"operation_id": op, "room": title,
+           "text_hash": kt.text_hash(title, str(text)),
+           "status": status, "code": code,
+           "chars": len(str(text)), "ts": time.time(),
+           "at": _now(), "src": "mcp"}
     _ops_append(rec)
 
     note = None

@@ -37,9 +37,11 @@ send 종료코드 (0=성공, 나머지=중단 지점):
 """
 import argparse
 import ctypes
+import hashlib
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -56,6 +58,84 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 #   워처와 전송이 동시에 돌면 서로 포커스를 뺏어 읽기 오염·전송 실패가 난다(실측).
 #   전송이 시작되면 이 파일을 만들고, 워처는 이 파일이 있는 동안 폴링을 건너뛴다.
 PAUSE_FILE = os.path.join(HERE, "_work", "watch_pause")
+
+# ★ 전송 원장 — CLI 와 MCP 가 같은 파일을 공유한다.
+#   같은 메시지를 두 번 보내는 사고를 막기 위한 기록.
+#   드는 이유: 전송 후 확인이 실패하는 경우가 실제로 있다(카톡이 긴 글을
+#   '전체보기'로 접으면 화면 전사로는 끝이 안 읽힌다). 그때 사람/에이전트가
+#   다시 보내면 같은 글이 두 번 도착한다. 원장으로 그걸 차단한다.
+SEND_LEDGER = os.path.join(HERE, "_work", "send_ops.jsonl")
+
+
+def text_hash(room, text):
+    """방 이름 + 본문으로 만든 짧은 식별자. 중복 판정용."""
+    h = hashlib.sha1()
+    h.update((room or "").encode("utf-8", "replace"))
+    h.update(b"\x00")
+    h.update((text or "").encode("utf-8", "replace"))
+    return h.hexdigest()[:16]
+
+
+def ledger_read():
+    """{operation_id: record} — 같은 ID 가 여러 번 있으면 마지막이 이긴다."""
+    out = {}
+    if not os.path.exists(SEND_LEDGER):
+        return out
+    try:
+        with open(SEND_LEDGER, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                op = rec.get("operation_id")
+                if op:
+                    out[op] = rec
+    except Exception:
+        pass
+    return out
+
+
+def ledger_get(operation_id):
+    if not operation_id:
+        return None
+    return ledger_read().get(operation_id)
+
+
+def ledger_append(rec):
+    os.makedirs(os.path.dirname(SEND_LEDGER), exist_ok=True)
+    try:
+        with open(SEND_LEDGER, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def ledger_recent_dup(room, text, within=60):
+    """within 초 안에 같은 방·같은 본문을 '실제로 보낸' 기록이 있으면 그것을 돌려준다.
+
+    failed 는 중복으로 보지 않는다 — 애초에 안 갔으니 다시 보내야 한다.
+    """
+    target = text_hash(room, text)
+    now = time.time()
+    hit = None
+    for rec in ledger_read().values():
+        if rec.get("text_hash") != target:
+            continue
+        if rec.get("status") not in ("sent", "sent_unverified"):
+            continue
+        try:
+            age = now - float(rec.get("ts") or 0)
+        except Exception:
+            continue
+        if 0 <= age <= within:
+            if hit is None or (rec.get("ts") or 0) > (hit.get("ts") or 0):
+                hit = rec
+    return hit
 
 
 def set_watch_pause(on: bool) -> None:
@@ -937,7 +1017,7 @@ def list_rooms():
     return cands
 
 
-def cmd_send(text, dry_run=True, to=None):
+def cmd_send(text, dry_run=True, to=None, operation_id=None, force=False, dup_window=60):
     # 방이 여러 개 열려 있는데 대상 미지정 → 오발송 위험. 중단.
     opened = list_rooms()
     if not to and len(opened) > 1:
@@ -951,8 +1031,58 @@ def cmd_send(text, dry_run=True, to=None):
         log("[send] 열린 방 창이 없습니다.")
         return 2
     hwnd, title = room
+
+    # ── 멱등 가드 ────────────────────────────────────────────────────────
+    # 목적: 전송 결과가 애매할 때(카톡이 긴 글을 접어 확인 실패 등) 사람이나
+    #       에이전트가 같은 글을 다시 보내 중복 발송되는 사고를 막는다.
+    # 1) operation_id 를 지정하면 그 ID 로 이미 처리된 적이 있는지 본다.
+    # 2) 지정이 없어도 dup_window 초 안에 같은 방에 같은 본문을 보낸 기록이
+    #    있으면 막는다. --force 로만 통과한다.
+    op = (operation_id or "").strip()
+    if op and not force:
+        prior = ledger_get(op)
+        if prior and prior.get("status") in ("sent", "sent_unverified"):
+            log(f"[send] ✗ 중단: operation_id '{op}' 는 이미 처리됐습니다 "
+                f"(status={prior.get('status')}, {prior.get('at')}).")
+            log("        재전송하지 않았습니다. 도착 여부는 read 로 확인하세요.")
+            log("        그래도 보내야 하면 --force 또는 새 operation_id 를 쓰세요.")
+            return 9
+
+    if not dry_run and not force:
+        dup = ledger_recent_dup(title, text, within=dup_window)
+        if dup:
+            log(f"[send] ✗ 중단: {dup_window}초 안에 같은 본문을 이미 보냈습니다 "
+                f"({dup.get('at')}, status={dup.get('status')}).")
+            log("        중복 발송으로 판단해 취소했습니다. 그래도 보내려면 --force.")
+            return 9
+
     log(f"[send] 대상 방='{title}' {'(dry-run)' if dry_run else '(실제 전송)'}")
-    return send_text(hwnd, title, text, expect_title=to, dry_run=dry_run)
+    code = send_text(hwnd, title, text, expect_title=to, dry_run=dry_run)
+
+    # ── 결과 기록 (dry_run 은 기록하지 않는다) ──
+    if not dry_run:
+        if code == 0:
+            status = "sent"
+        elif code == 6:
+            # 전송은 됐으나 확인 실패 — 카톡이 긴 글을 '전체보기'로 접은 경우 등
+            status = "sent_unverified"
+        else:
+            status = "failed"
+        ledger_append({
+            "operation_id": op or ("auto-" + secrets.token_hex(8)),
+            "room": title,
+            "text_hash": text_hash(title, text),
+            "status": status,
+            "code": code,
+            "chars": len(text or ""),
+            "ts": time.time(),
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "src": "cli",
+        })
+        if status == "sent_unverified":
+            log("[send] ⚠ 전송은 실행됐으나 확인이 실패했습니다(긴 글 접힘 등).")
+            log("        재전송하지 말고 read 로 실제 도착을 확인하세요.")
+    return code
 
 
 def cmd_size():
@@ -1054,6 +1184,13 @@ def main():
                         help="전송 전 방 이름 대조 (지정 시)")
     p_send.add_argument("--yes", action="store_true")
     p_send.add_argument("--dry-run", action="store_true")
+    p_send.add_argument("--op-id", default=None, metavar="ID",
+                        help="작업 식별자. 같은 ID 재사용 시 중복 전송을 막는다 "
+                             "(예: reply-20261105-01)")
+    p_send.add_argument("--force", action="store_true",
+                        help="멱등/중복 가드를 무시하고 강제 전송")
+    p_send.add_argument("--dup-window", type=int, default=60, metavar="초",
+                        help="같은 본문 중복 차단 시간 (기본 60초)")
     sub.add_parser("size")
     sub.add_parser("windows")
     p_alerts = sub.add_parser("alerts")
@@ -1071,7 +1208,9 @@ def main():
         return cmd_read(a.name, "ocr" if a.ocr else "clip", a.json,
                         a.last, a.max_chars, a.save, a.deep, a.since, a.max_scroll)
     if a.cmd == "send":
-        return cmd_send(a.text, dry_run=not a.yes, to=a.to)
+        return cmd_send(a.text, dry_run=not a.yes, to=a.to,
+                        operation_id=a.op_id, force=a.force,
+                        dup_window=a.dup_window)
     if a.cmd == "size":
         return cmd_size()
     if a.cmd == "windows":
